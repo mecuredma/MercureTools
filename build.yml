@@ -1,0 +1,63 @@
+name: Build MercureTools
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # --- openFPGALoader (flash) récupéré via MSYS2 et embarqué dans l'exe ---
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        continue-on-error: true
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-openFPGALoader
+
+      - name: Bundle openFPGALoader + DLLs
+        shell: msys2 {0}
+        continue-on-error: true
+        run: |
+          mkdir -p tools
+          cp /mingw64/bin/openFPGALoader.exe tools/
+          ldd /mingw64/bin/openFPGALoader.exe | grep -i mingw64 | awk '{print $3}' | xargs -I{} cp -n "{}" tools/
+          ls -la tools
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install leechcorepyc (optionnel)
+        continue-on-error: true
+        run: pip install leechcorepyc
+
+      - name: Build exe (PyInstaller)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tools | Out-Null
+          pyinstaller --noconfirm --onefile --windowed --uac-admin `
+            --name MercureTools `
+            --collect-all customtkinter `
+            --collect-all pyftdi `
+            --collect-all libusb_package `
+            --collect-all leechcorepyc `
+            --add-data "tools;tools" `
+            main.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MercureTools-exe
+          path: dist/MercureTools.exe
