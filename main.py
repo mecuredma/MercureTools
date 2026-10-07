@@ -70,10 +70,7 @@ def make_card(parent):
 
 
 def primary_btn(parent, text, command, **kw):
-    return ctk.CTkButton(
-        parent,
-        text=text,
-        command=command,
+    opts = dict(
         fg_color=ACCENT_BG,
         hover_color=ACCENT_HOVER,
         border_color=ACCENT,
@@ -82,15 +79,13 @@ def primary_btn(parent, text, command, **kw):
         corner_radius=18,
         height=38,
         font=ctk.CTkFont(size=13, weight="bold"),
-        **kw,
     )
+    opts.update(kw)  # les valeurs passées à l'appel remplacent les défauts
+    return ctk.CTkButton(parent, text=text, command=command, **opts)
 
 
 def secondary_btn(parent, text, command, **kw):
-    return ctk.CTkButton(
-        parent,
-        text=text,
-        command=command,
+    opts = dict(
         fg_color="#07070d",
         hover_color="#14141f",
         border_color=BORDER,
@@ -99,15 +94,13 @@ def secondary_btn(parent, text, command, **kw):
         corner_radius=18,
         height=38,
         font=ctk.CTkFont(size=13, weight="bold"),
-        **kw,
     )
+    opts.update(kw)
+    return ctk.CTkButton(parent, text=text, command=command, **opts)
 
 
 def danger_btn(parent, text, command, **kw):
-    return ctk.CTkButton(
-        parent,
-        text=text,
-        command=command,
+    opts = dict(
         fg_color="#14070a",
         hover_color="#260b10",
         border_color=RED,
@@ -116,8 +109,9 @@ def danger_btn(parent, text, command, **kw):
         corner_radius=18,
         height=34,
         font=ctk.CTkFont(size=12, weight="bold"),
-        **kw,
     )
+    opts.update(kw)
+    return ctk.CTkButton(parent, text=text, command=command, **opts)
 
 
 def card_title(parent, text, color=CYAN):
