@@ -21,7 +21,7 @@ class MercureToolsApp(ctk.CTk):
         super().__init__()
 
         self.title("MercureTools - v1.0.0")
-        self.geometry("1280x720")  # CORRIGÉ : Utilisation de 'x' au lieu de '-'
+        self.geometry("1280x720")
         self.minsize(1050, 650)
 
         # Fond noir pur absolu
@@ -172,4 +172,13 @@ class MercureToolsApp(ctk.CTk):
         def start_flash():
             path = self.file_path_var.get()
             if "No file" in path:
-                messagebox.showerror("Error", "Please select a valid
+                messagebox.showerror("Error", "Please select a valid firmware file first!")
+                return
+            self.log_box.insert("end", "[INFO] Starting flashing process...\n[INFO] Writing data to device... Please wait.\n")
+
+        ctk.CTkButton(card, text="Flash Device Now", fg_color="#1f2937", hover_color="#374151", text_color="#FFFFFF", command=start_flash).pack(anchor="w", padx=20, pady=(15, 20))
+        self.frames["Device Flasher"] = frame
+
+    def create_makcu_frame(self):
+        frame = ctk.CTkFrame(self.main_container, fg_color="#000000", corner_radius=0)
+        frame.grid(row=0,
