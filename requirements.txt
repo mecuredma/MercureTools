@@ -1,7 +1,3 @@
 customtkinter>=5.2.2
-pyftdi>=0.55.0
-libusb-package>=1.0.26
-pyserial>=3.5
-pyinstaller>=6.6
-# optionnel (speed test) : installé séparément dans le workflow
-# leechcorepyc
+pillow>=10.0.0
+pyinstaller>=6.0.0
