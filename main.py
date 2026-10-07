@@ -1,513 +1,839 @@
 """
-MercureTools - AIO pour cartes DMA FPGA (Artix-7 35T / 75T / 100T)
-Backends :
-  - pyftdi          -> détection IDCODE + lecture DNA via JTAG (FT2232H / FT232H / FT4232H)
-  - openFPGALoader  -> flash du .bin (embarqué dans l'exe par le workflow GitHub)
-  - leechcorepyc    -> speed test (nécessite FTD3XX.dll / carte active côté cible)
-  - pyserial        -> gestion Makcu (CH343, commandes "km.*")
+MercureTools v1.0.0 - AIO management tool for PCIe FPGA boards (Artix-7 35T / 75T / 100T).
+
+Single-file CustomTkinter application, ready for PyInstaller.
+External helpers (OpenOCD, installers, benchmark tools) are looked up in a "tools"
+folder placed next to main.py / the built executable. Anything missing is reported
+in the console instead of crashing the app.
+
+    tools/openocd/bin/openocd.exe          (or openocd on PATH)
+    tools/cfg/flash_35T.cfg, flash_75T.cfg, flash_100T.cfg   (your flashing scripts)
+    tools/drivers/FTD3XX_Driver.exe, CH341SER.EXE, CH343SER.EXE
+    tools/speedtest/SpeedTest.exe, tools/dmatest/DMATestTool.exe
+    tools/makcu/MakcuAIO.exe
 """
+
+import ctypes
 import os
-import sys
-import time
 import queue
+import random
+import re
 import shutil
-import threading
 import subprocess
+import sys
+import threading
+import time
 import webbrowser
-from tkinter import filedialog
+from pathlib import Path
+from tkinter import Canvas, filedialog
 
 import customtkinter as ctk
+from PIL import Image, ImageDraw
 
 APP_NAME = "MercureTools"
-VERSION = "1.0.0"
+APP_VERSION = "1.0.0"
+DISCORD_URL = "https://discord.gg/UpywRnsTAA"
 
-# ---- Charte "Mercure" -------------------------------------------------------
-BG = "#0a0e14"
-PANEL = "#111823"
-CARD = "#172131"
-SILVER = "#c9d4e3"
-ACCENT = "#38bdf8"
-ACCENT_HOVER = "#0ea5e9"
-OK = "#4ade80"
-WARN = "#fbbf24"
-ERR = "#f87171"
+# ----------------------------------------------------------------------------- theme
+BG = "#0b0c10"
+BG_DEEP = "#07080b"
+SIDEBAR = "#0d0e13"
+CARD = "#11131a"
+CARD_HI = "#161924"
+BORDER = "#1f2433"
+SILVER = "#d5dbe8"
+MUTED = "#7b8499"
+ACCENT = "#8fb4ff"
+ACCENT_DIM = "#3a4a73"
+ACCENT_BG = "#151a2b"
+DANGER = "#ff6b7d"
+DANGER_BG = "#1e1015"
+OK = "#6fe3b0"
+WARN = "#e8c27a"
 
-# ---- Données matériel -------------------------------------------------------
-# IDCODE JTAG Artix-7 (masqué sur les 28 bits bas, la version est dans les 4 bits hauts)
-IDCODES = {
-    0x0362D093: "XC7A35T",
-    0x03632093: "XC7A75T",
-    0x03631093: "XC7A100T",
-}
-MODELS = {
-    "35T": "xc7a35tfgg484",
-    "75T": "xc7a75tfgg484",
-    "100T": "xc7a100tfgg484",
-}
-# nom affiché -> (URL pyftdi, nom openFPGALoader)
-CABLES = {
-    "FT2232H": ("ftdi://ftdi:2232h/1", "ft2232"),
-    "FT232H": ("ftdi://ftdi:232h/1", "ft232"),
-    "FT4232H": ("ftdi://ftdi:4232h/1", "ft4232"),
-}
-LINKS = {
-    "Zadig (WinUSB pour JTAG)": "https://zadig.akeo.ie/",
-    "Pilotes FTDI (VCP/D2XX)": "https://ftdichip.com/drivers/",
-    "Pilote WCH CH343 (Makcu)": "https://www.wch-ic.com/downloads/CH343SER_EXE.html",
+FONT = "Segoe UI"
+MONO = "Consolas"
+
+LEVEL_COLORS = {"INFO": "#9fb4d8", "OK": OK, "WARN": WARN, "ERR": DANGER}
+
+BOARDS = ["35T", "75T", "100T"]
+BOARD_LABELS = {
+    "35T": "35T (Squirrel / Screamer)",
+    "75T": "75T (Enigma X1 / Raptor)",
+    "100T": "100T (ZDMA / Gbox)",
 }
 
+# Artix-7 JTAG IDCODEs (version nibble masked out)
+XILINX_IDS = {
+    0x0362D093: ("XC7A35T", "35T"),
+    0x03631093: ("XC7A75T", "75T"),
+    0x03632093: ("XC7A100T", "100T"),
+}
 
-def resource_path(rel):
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, rel)
+# OpenOCD interface scripts - edit to match the OpenOCD build you ship.
+INTERFACES = {
+    "CH347": "interface/ch347.cfg",
+    "FTDI": "interface/ftdi/um232h.cfg",
+}
 
-
-def find_ofl():
-    p = resource_path(os.path.join("tools", "openFPGALoader.exe"))
-    if os.path.isfile(p):
-        return p
-    return shutil.which("openFPGALoader")
-
-
-def run_cmd(cmd, log):
-    env = os.environ.copy()
-    env["PATH"] = os.path.dirname(os.path.abspath(cmd[0])) + os.pathsep + env.get("PATH", "")
-    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, errors="replace", env=env, creationflags=flags)
-    for line in p.stdout:
-        if line.strip():
-            log(line.rstrip())
-    return p.wait()
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-# ---- JTAG (pyftdi) ----------------------------------------------------------
-def jtag_open(url):
-    from pyftdi.jtag import JtagEngine, JtagTool
-    eng = JtagEngine(trst=False, frequency=1e6)
-    eng.configure(url)
-    eng.reset()
-    return eng, JtagTool(eng)
+# ----------------------------------------------------------------------------- helpers
+def tools_dir() -> Path:
+    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    return base / "tools"
 
 
-def jtag_idcode(cable_name):
-    """Retourne (idcode, nom_cable) en essayant le câble choisi ou tous (Auto)."""
-    names = list(CABLES) if cable_name == "Auto" else [cable_name]
-    last = None
-    for n in names:
-        try:
-            eng, tool = jtag_open(CABLES[n][0])
+TOOLS = tools_dir()
+
+
+def find_openocd():
+    for candidate in (TOOLS / "openocd" / "bin" / "openocd.exe", TOOLS / "openocd.exe"):
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("openocd")
+
+
+def blend(c1: str, c2: str, t: float) -> str:
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{int(a[i] + (b[i] - a[i]) * t):02x}" for i in range(3))
+
+
+def enable_dark_titlebar(win):
+    if sys.platform != "win32":
+        return
+    try:
+        win.update()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (new / old build)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(ctypes.c_int(1)), 4)
+    except Exception:
+        pass
+
+
+def make_planet_icon(size: int) -> ctk.CTkImage:
+    s = size * 4
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    c, r = s / 2, s * 0.26
+    for i in range(10, 0, -1):  # corona
+        rr = r + i * s * 0.012
+        col = (143, 180, 255, int(10 + (10 - i) * 4))
+        d.ellipse((c - rr, c - rr, c + rr, c + rr), fill=col)
+    d.arc((s * 0.04, c - s * 0.12, s * 0.96, c + s * 0.12), 180, 360, fill=(213, 219, 232, 200), width=int(s * 0.025))
+    d.ellipse((c - r, c - r, c + r, c + r), fill=(4, 5, 8, 255), outline=(170, 182, 208, 255), width=int(s * 0.02))
+    d.arc((c - r, c - r, c + r, c + r), -55, 40, fill=(235, 242, 255, 255), width=int(s * 0.045))
+    d.arc((s * 0.04, c - s * 0.12, s * 0.96, c + s * 0.12), 0, 180, fill=(213, 219, 232, 255), width=int(s * 0.025))
+    img = img.resize((size, size), Image.LANCZOS)
+    return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+
+
+def make_discord_icon(size: int) -> ctk.CTkImage:
+    s = size * 4
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, s * 0.12, s, s * 0.88), radius=s * 0.3, fill=(88, 101, 242, 255))
+    for x in (0.32, 0.68):
+        d.ellipse((s * (x - 0.1), s * 0.38, s * (x + 0.1), s * 0.62), fill=(255, 255, 255, 255))
+    img = img.resize((size, size), Image.LANCZOS)
+    return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+
+
+def launch_file(app, path: Path, label: str):
+    if not path.exists():
+        app.log(f"{label} not found: {path}", "WARN")
+        return
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(path))  # noqa: S606
+        else:
+            subprocess.Popen([str(path)])
+        app.log(f"{label} launched.", "OK")
+    except Exception as exc:
+        app.log(f"Could not launch {label}: {exc}", "ERR")
+
+
+# ----------------------------------------------------------------------------- backend
+class ToolMissing(Exception):
+    pass
+
+
+def run_openocd(args, timeout=25) -> str:
+    exe = find_openocd()
+    if not exe:
+        raise ToolMissing("OpenOCD not found. Put it in tools/openocd/bin or add it to PATH.")
+    proc = subprocess.run(
+        [exe, *args], capture_output=True, text=True, timeout=timeout, creationflags=NO_WINDOW
+    )
+    return (proc.stdout or "") + (proc.stderr or "")
+
+
+def interface_candidates(choice: str):
+    return list(INTERFACES.items()) if choice == "Auto" else [(choice, INTERFACES[choice])]
+
+
+def detect_chip(iface_choice: str, log):
+    """Return dict(chip, idcode, interface, board) or None."""
+    for name, cfg in interface_candidates(iface_choice):
+        log(f"Probing JTAG chain via {name} ...", "INFO")
+        out = run_openocd([
+            "-f", cfg,
+            "-c", "transport select jtag",
+            "-c", "adapter speed 10000",
+            "-c", "jtag newtap chip tap -irlen 6 -ignore-version",
+            "-c", "init", "-c", "scan_chain", "-c", "exit",
+        ])
+        for m in re.finditer(r"0x([0-9a-fA-F]{8})", out):
+            code = int(m.group(1), 16) & 0x0FFFFFFF
+            if code in XILINX_IDS:
+                chip, board = XILINX_IDS[code]
+                return {"chip": chip, "idcode": f"0x{code:08X}", "interface": name, "board": board}
+        log(f"No Artix-7 found on {name}.", "WARN")
+    return None
+
+
+def read_device_dna(iface_choice: str, log):
+    """Read the 57-bit Device DNA via the FUSE_DNA instruction (0x32)."""
+    for name, cfg in interface_candidates(iface_choice):
+        log(f"Reading Device DNA via {name} ...", "INFO")
+        out = run_openocd([
+            "-f", cfg,
+            "-c", "transport select jtag",
+            "-c", "adapter speed 10000",
+            "-c", "jtag newtap xc7 tap -irlen 6 -ignore-version",
+            "-c", "init",
+            "-c", "irscan xc7.tap 0x32",
+            "-c", "drscan xc7.tap 64 0x0",
+            "-c", "exit",
+        ])
+        hits = re.findall(r"^\s*([0-9a-fA-F]{8,16})\s*$", out, re.MULTILINE)
+        if hits:
+            value = int(hits[-1], 16) & ((1 << 57) - 1)
+            return f"0x{value:015X}"
+    return None
+
+
+class ProcessRunner:
+    """Runs one external process, streams its output line by line."""
+
+    def __init__(self, app):
+        self.app, self.proc = app, None
+
+    @property
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, cmd, on_line, on_done):
+        if self.running:
+            return
+
+        def work():
+            code = -1
             try:
-                code = tool.idcode()
-            finally:
-                eng.close()
-            if code not in (0, 0xFFFFFFFF):
-                return code, n
-        except Exception as e:  # noqa
-            last = e
-    raise RuntimeError(f"Aucune interface JTAG FTDI trouvée ({last}). "
-                       "Vérifie le driver WinUSB (onglet Drivers) et le câblage.")
+                self.proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    bufsize=1, creationflags=NO_WINDOW,
+                )
+                for line in self.proc.stdout:
+                    self.app.post(on_line, line.rstrip())
+                code = self.proc.wait()
+            except Exception as exc:
+                self.app.post(on_line, f"[error] {exc}")
+            self.app.post(on_done, code)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def kill(self):
+        if self.running:
+            self.proc.kill()
 
 
-def jtag_dna(cable_name):
-    from pyftdi.bits import BitSequence
-    names = list(CABLES) if cable_name == "Auto" else [cable_name]
-    last = None
-    for n in names:
-        try:
-            eng, tool = jtag_open(CABLES[n][0])
+# ----------------------------------------------------------------------------- widgets
+def make_button(master, text, command, kind="normal", **kw):
+    palette = {
+        "normal": dict(fg_color=CARD_HI, border_color=BORDER, hover_color="#1c2132", text_color=SILVER),
+        "glow": dict(fg_color=ACCENT_BG, border_color=ACCENT, hover_color="#1d2540", text_color="#eaf1ff"),
+        "danger": dict(fg_color=DANGER_BG, border_color=DANGER, hover_color="#2a141b", text_color="#ffd9de"),
+        "small": dict(fg_color=CARD_HI, border_color=BORDER, hover_color="#1c2132", text_color=MUTED),
+    }[kind]
+    size = 11 if kind == "small" else 13
+    btn = ctk.CTkButton(
+        master, text=text, command=command, border_width=1, corner_radius=10,
+        font=ctk.CTkFont(FONT, size, "bold" if kind != "small" else "normal"),
+        height=28 if kind == "small" else 40, **palette, **kw,
+    )
+    if kind == "glow":
+        btn.bind("<Enter>", lambda e: btn.configure(border_color="#c4d7ff", border_width=2), add="+")
+        btn.bind("<Leave>", lambda e: btn.configure(border_color=ACCENT, border_width=1), add="+")
+    return btn
+
+
+def make_card(master, **kw):
+    return ctk.CTkFrame(master, fg_color=CARD, border_color=BORDER, border_width=1, corner_radius=14, **kw)
+
+
+def card_title(master, text):
+    return ctk.CTkLabel(master, text=text, font=ctk.CTkFont(FONT, 12, "bold"), text_color=ACCENT, anchor="w")
+
+
+def make_log_box(master, **kw):
+    box = ctk.CTkTextbox(
+        master, fg_color=BG_DEEP, border_color=BORDER, border_width=1, corner_radius=10,
+        text_color="#9fb4d8", font=(MONO, 11), wrap="word", **kw,
+    )
+    for lvl, col in LEVEL_COLORS.items():
+        box.tag_config(lvl, foreground=col)
+    box.configure(state="disabled")
+    return box
+
+
+def append_text(box, text, tag="INFO"):
+    box.configure(state="normal")
+    box.insert("end", text + "\n", tag)
+    box.see("end")
+    box.configure(state="disabled")
+
+
+class BaseView(ctk.CTkFrame):
+    def __init__(self, app, parent, title, subtitle):
+        super().__init__(parent, fg_color="transparent")
+        self.app = app
+        ctk.CTkLabel(self, text=title, font=ctk.CTkFont(FONT, 24, "bold"), text_color=SILVER, anchor="w").pack(fill="x")
+        ctk.CTkLabel(self, text=subtitle, font=ctk.CTkFont(FONT, 12), text_color=MUTED, anchor="w").pack(fill="x", pady=(2, 14))
+
+    def on_show(self):
+        pass
+
+
+class EclipseArt(Canvas):
+    """Eclipse with a thin corona and planetary rings, redrawn on resize."""
+
+    def __init__(self, master):
+        super().__init__(master, bg=BG, highlightthickness=0, bd=0)
+        self.bind("<Configure>", lambda e: self.draw())
+
+    def draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 80 or h < 80:
+            return
+        rnd = random.Random(7)
+        for _ in range(70):
+            x, y = rnd.randint(0, w), rnd.randint(0, h)
+            self.create_oval(x, y, x + 1, y + 1, fill=blend(BG, SILVER, rnd.uniform(0.15, 0.55)), outline="")
+        cx, cy = w / 2, h / 2
+        r = min(w * 0.18, h * 0.34)
+        steps = 26
+        for i in range(steps, 0, -1):  # corona
+            rr = r + i * r * 0.04
+            t = ((steps - i) / steps) ** 2.4 * 0.42
+            self.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill=blend(BG, "#5b8def", t), outline="")
+        rings = [(2.5, 0.55, 0.55), (2.0, 0.44, 0.35), (3.1, 0.68, 0.22)]
+        for sx, sy, a in rings:  # back half
+            self.create_arc(cx - r * sx, cy - r * sy, cx + r * sx, cy + r * sy, start=0, extent=180,
+                            style="arc", outline=blend(BG, SILVER, a), width=1)
+        self.create_oval(cx - r, cy - r, cx + r, cy + r, fill="#000000", outline=blend(BG, SILVER, 0.5))
+        self.create_arc(cx - r, cy - r, cx + r, cy + r, start=-55, extent=100, style="arc",
+                        outline="#e8efff", width=2)  # bright limb
+        for sx, sy, a in rings:  # front half
+            self.create_arc(cx - r * sx, cy - r * sy, cx + r * sx, cy + r * sy, start=180, extent=180,
+                            style="arc", outline=blend(BG, SILVER, a + 0.15), width=1)
+
+
+# ----------------------------------------------------------------------------- views
+class AutoDetectView(BaseView):
+    FIELDS = ["Chip", "IDCODE", "Interface", "Selected Board"]
+
+    def __init__(self, app, parent):
+        super().__init__(app, parent, "Hardware Auto-Detect", "Detect the Artix-7 chip via the IDCODE JTAG")
+        card = make_card(self)
+        card.pack(fill="x")
+        card_title(card, "Detected hardware").pack(fill="x", padx=20, pady=(16, 6))
+        self.values = {}
+        for i, name in enumerate(self.FIELDS):
+            row = ctk.CTkFrame(card, fg_color="transparent")
+            row.pack(fill="x", padx=20)
+            ctk.CTkLabel(row, text=name, width=140, anchor="w", font=ctk.CTkFont(FONT, 13), text_color=MUTED).pack(side="left", pady=9)
+            val = ctk.CTkLabel(row, text="-", anchor="w", font=ctk.CTkFont(MONO, 14), text_color=SILVER)
+            val.pack(side="left", fill="x", expand=True)
+            self.values[name] = val
+            if i < len(self.FIELDS) - 1:
+                ctk.CTkFrame(card, height=1, fg_color=BORDER).pack(fill="x", padx=20)
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.pack(fill="x", padx=20, pady=(14, 18))
+        self.btn = make_button(bottom, "Start Detection", self.start, "glow", width=190)
+        self.btn.pack(side="left")
+        self.status = ctk.CTkLabel(bottom, text="Ready", font=ctk.CTkFont(FONT, 12), text_color=MUTED)
+        self.status.pack(side="left", padx=14)
+        EclipseArt(self).pack(fill="both", expand=True, pady=(12, 0))
+        self.refresh_board()
+        app.board_listeners.append(self.refresh_board)
+
+    def refresh_board(self):
+        self.values["Selected Board"].configure(text=self.app.board_var.get())
+
+    def start(self):
+        self.btn.configure(state="disabled")
+        self.status.configure(text="Scanning JTAG chain ...", text_color=ACCENT)
+        self.app.log("Auto-detect started.")
+
+        def work():
             try:
-                eng.write_ir(BitSequence(0x17, length=6))  # ISC_DNA (7-series)
-                raw = int(eng.read_dr(64))
-                eng.go_idle()
-                eng.reset()
-            finally:
-                eng.close()
-            return raw
-        except Exception as e:  # noqa
-            last = e
-    raise RuntimeError(f"Lecture DNA impossible ({last})")
+                res = detect_chip(self.app.iface_var.get(), self.app.log_threadsafe)
+                self.app.post(self.finish, res, None)
+            except ToolMissing as exc:
+                self.app.post(self.finish, None, str(exc))
+            except Exception as exc:
+                self.app.post(self.finish, None, f"Detection failed: {exc}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish(self, res, error):
+        self.btn.configure(state="normal")
+        if res:
+            self.values["Chip"].configure(text=res["chip"])
+            self.values["IDCODE"].configure(text=res["idcode"])
+            self.values["Interface"].configure(text=res["interface"])
+            self.app.select_board(res["board"])
+            self.status.configure(text="Device found", text_color=OK)
+            self.app.set_hardware(f"{res['chip']} connected", True)
+            self.app.log(f"Detected {res['chip']} ({res['idcode']}) via {res['interface']}.", "OK")
+        else:
+            self.status.configure(text=error or "No device found", text_color=DANGER)
+            self.app.set_hardware("No hardware connected", False)
+            self.app.log(error or "No Artix-7 device found on the JTAG chain.", "ERR")
 
 
-# ---- Application ------------------------------------------------------------
-class App(ctk.CTk):
+class DNAView(BaseView):
+    def __init__(self, app, parent):
+        super().__init__(app, parent, "DNA Grabber", "Read the unique 57-bit Xilinx Device DNA of the connected chip via JTAG")
+        card = make_card(self)
+        card.pack(fill="x")
+        card_title(card, "Device DNA").pack(fill="x", padx=20, pady=(16, 8))
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=20)
+        self.field = ctk.CTkEntry(row, height=42, fg_color=BG_DEEP, border_color=BORDER, text_color=SILVER,
+                                  font=ctk.CTkFont(MONO, 14), corner_radius=10)
+        self.field.pack(side="left", fill="x", expand=True)
+        self.set_value("0x000000000000000  (click 'Read Device DNA')")
+        make_button(row, "Copy DNA", self.copy, "normal", width=120).pack(side="left", padx=(10, 0))
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.pack(fill="x", padx=20, pady=(14, 18))
+        self.btn = make_button(bottom, "Read Device DNA", self.read, "glow", width=190)
+        self.btn.pack(side="left")
+        self.status = ctk.CTkLabel(bottom, text="Ready", font=ctk.CTkFont(FONT, 12), text_color=MUTED)
+        self.status.pack(side="left", padx=14)
+        note = make_card(self)
+        note.pack(fill="x", pady=(12, 0))
+        ctk.CTkLabel(
+            note, justify="left", anchor="w", font=ctk.CTkFont(FONT, 12), text_color=MUTED,
+            text="DNA is read through OpenOCD over JTAG. Connect your JTAG cable first.\n"
+                 "The value is burned into the silicon and unique to each chip.",
+        ).pack(fill="x", padx=20, pady=12)
+        EclipseArt(self).pack(fill="both", expand=True, pady=(12, 0))
+
+    def set_value(self, text):
+        self.field.configure(state="normal")
+        self.field.delete(0, "end")
+        self.field.insert(0, text)
+        self.field.configure(state="readonly")
+
+    def copy(self):
+        text = self.field.get().split()[0]
+        self.app.clipboard_clear()
+        self.app.clipboard_append(text)
+        self.app.log("DNA copied to clipboard.", "OK")
+
+    def read(self):
+        self.btn.configure(state="disabled")
+        self.status.configure(text="Reading ...", text_color=ACCENT)
+
+        def work():
+            try:
+                dna = read_device_dna(self.app.iface_var.get(), self.app.log_threadsafe)
+                self.app.post(self.finish, dna, None if dna else "No DNA returned. Check the JTAG connection.")
+            except ToolMissing as exc:
+                self.app.post(self.finish, None, str(exc))
+            except Exception as exc:
+                self.app.post(self.finish, None, f"DNA read failed: {exc}")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish(self, dna, error):
+        self.btn.configure(state="normal")
+        if dna:
+            self.set_value(dna)
+            self.status.configure(text="DNA read", text_color=OK)
+            self.app.log(f"Device DNA: {dna}", "OK")
+        else:
+            self.status.configure(text="Failed", text_color=DANGER)
+            self.app.log(error, "ERR")
+
+
+class SpeedTestView(BaseView):
+    TOOL_PATHS = {
+        "Lone's Speed Test": TOOLS / "speedtest" / "SpeedTest.exe",
+        "Neko's DMATestTool": TOOLS / "dmatest" / "DMATestTool.exe",
+    }
+
+    def __init__(self, app, parent):
+        super().__init__(app, parent, "Speed Test", "Benchmark raw PCIe physical memory read / write throughput")
+        self.runner = ProcessRunner(app)
+        self.grid_columnconfigure(0, weight=1, uniform="c")
+        self.grid_columnconfigure(1, weight=1, uniform="c")
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        body.grid_columnconfigure((0, 1), weight=1, uniform="c")
+        body.grid_rowconfigure(0, weight=1)
+        left = make_card(body)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        card_title(left, "Benchmark tool").pack(fill="x", padx=18, pady=(16, 8))
+        self.tool = ctk.CTkSegmentedButton(
+            left, values=list(self.TOOL_PATHS), fg_color=BG_DEEP, selected_color=ACCENT_BG,
+            selected_hover_color="#1d2540", unselected_color=BG_DEEP, unselected_hover_color=CARD_HI,
+            text_color=SILVER, font=ctk.CTkFont(FONT, 12, "bold"), height=34,
+        )
+        self.tool.set("Lone's Speed Test")
+        self.tool.pack(fill="x", padx=18)
+        self.start_btn = make_button(left, "Start Speed Benchmark", self.start, "glow")
+        self.start_btn.pack(fill="x", padx=18, pady=(14, 8))
+        make_button(left, "Stop Test", self.runner.kill, "danger").pack(fill="x", padx=18)
+        right = make_card(body)
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        card_title(right, "Live benchmark stream").pack(fill="x", padx=18, pady=(16, 8))
+        self.stream = make_log_box(right)
+        self.stream.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        append_text(self.stream, "=== Benchmark ready ===\nPick a tool and press Start Speed Benchmark.", "OK")
+
+    def start(self):
+        name = self.tool.get()
+        exe = self.TOOL_PATHS[name]
+        if not exe.exists():
+            self.app.log(f"{name} not found: {exe}", "WARN")
+            append_text(self.stream, f"{name} not found.\nExpected at: {exe}", "WARN")
+            return
+        self.start_btn.configure(state="disabled")
+        append_text(self.stream, f"--- {name} ---", "OK")
+        self.app.log(f"Running {name}.")
+        self.runner.start(
+            [str(exe)], lambda line: append_text(self.stream, line), self.done
+        )
+
+    def done(self, code):
+        self.start_btn.configure(state="normal")
+        append_text(self.stream, f"--- finished (exit code {code}) ---", "OK" if code == 0 else "WARN")
+        self.app.log(f"Benchmark finished (exit code {code}).", "OK" if code == 0 else "WARN")
+
+
+class DriversView(BaseView):
+    def __init__(self, app, parent):
+        super().__init__(app, parent, "Drivers", "Install the USB data and JTAG drivers required by your board")
+        card = make_card(self)
+        card.pack(fill="x")
+        card_title(card, "Hardware drivers").pack(fill="x", padx=20, pady=(16, 4))
+        ctk.CTkLabel(card, text="Launches the signed installers from the tools/drivers folder.",
+                     font=ctk.CTkFont(FONT, 12), text_color=MUTED, anchor="w").pack(fill="x", padx=20, pady=(0, 10))
+        d = TOOLS / "drivers"
+        make_button(card, "Install Data Driver  (FTDI FTD3XX)",
+                    lambda: launch_file(app, d / "FTD3XX_Driver.exe", "FTD3XX driver installer")).pack(fill="x", padx=20, pady=(0, 8))
+        make_button(card, "Install JTAG Driver  (CH347 / CH341)",
+                    lambda: launch_file(app, d / "CH341SER.EXE", "CH341 driver installer")).pack(fill="x", padx=20, pady=(0, 18))
+        EclipseArt(self).pack(fill="both", expand=True, pady=(12, 0))
+
+
+class FlasherView(BaseView):
+    def __init__(self, app, parent):
+        super().__init__(app, parent, "Device Flasher", "Flash a custom firmware (.bin) to the FPGA configuration flash")
+        self.runner = ProcessRunner(app)
+        self.bin_path = ctk.StringVar()
+        self.delete_after = ctk.BooleanVar(value=False)
+        card = make_card(self)
+        card.pack(fill="x")
+        card_title(card, "Firmware flashing").pack(fill="x", padx=20, pady=(16, 8))
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=20, pady=(0, 8))
+        ctk.CTkLabel(row, text="Target board", width=110, anchor="w", font=ctk.CTkFont(FONT, 13), text_color=MUTED).pack(side="left")
+        self.board_menu = ctk.CTkOptionMenu(
+            row, values=list(BOARD_LABELS.values()), command=self.on_menu, height=34, fg_color=BG_DEEP,
+            button_color=CARD_HI, button_hover_color="#1c2132", dropdown_fg_color=CARD,
+            dropdown_hover_color=CARD_HI, text_color=SILVER, font=ctk.CTkFont(FONT, 12),
+        )
+        self.board_menu.pack(side="left", fill="x", expand=True)
+        row2 = ctk.CTkFrame(card, fg_color="transparent")
+        row2.pack(fill="x", padx=20, pady=(0, 8))
+        self.entry = ctk.CTkEntry(row2, textvariable=self.bin_path, height=36, fg_color=BG_DEEP, border_color=BORDER,
+                                  placeholder_text="Select custom firmware (.bin) ...", text_color=SILVER, corner_radius=10)
+        self.entry.pack(side="left", fill="x", expand=True)
+        make_button(row2, "Browse .bin", self.browse, "normal", width=120, height=36).pack(side="left", padx=(10, 0))
+        ctk.CTkCheckBox(card, text="Delete binary after successful flash", variable=self.delete_after,
+                        font=ctk.CTkFont(FONT, 12), text_color=MUTED, fg_color=ACCENT_DIM, hover_color=ACCENT,
+                        border_color=BORDER, checkmark_color="#eaf1ff").pack(anchor="w", padx=20, pady=(2, 12))
+        self.flash_btn = make_button(card, "Flash Custom Firmware", self.flash, "glow")
+        self.flash_btn.pack(fill="x", padx=20, pady=(0, 8))
+        make_button(card, "Kill Flashing", self.runner.kill, "danger").pack(fill="x", padx=20, pady=(0, 18))
+        EclipseArt(self).pack(fill="both", expand=True, pady=(12, 0))
+        self.sync_menu()
+        app.board_listeners.append(self.sync_menu)
+
+    def sync_menu(self):
+        self.board_menu.set(BOARD_LABELS[self.app.board_var.get()])
+
+    def on_menu(self, label):
+        self.app.select_board(label.split()[0])
+
+    def browse(self):
+        path = filedialog.askopenfilename(title="Select firmware", filetypes=[("Firmware", "*.bin"), ("All files", "*.*")])
+        if path:
+            self.bin_path.set(path)
+
+    def flash(self):
+        path = Path(self.bin_path.get().strip())
+        board = self.app.board_var.get()
+        if not path.is_file():
+            self.app.log("Select a valid firmware (.bin) file first.", "WARN")
+            return
+        exe = find_openocd()
+        if not exe:
+            self.app.log("OpenOCD not found. Put it in tools/openocd/bin or add it to PATH.", "ERR")
+            return
+        flash_cfg = TOOLS / "cfg" / f"flash_{board}.cfg"
+        if not flash_cfg.exists():
+            self.app.log(f"Flash script missing: {flash_cfg}", "ERR")
+            return
+        iface = self.app.iface_var.get()
+        iface_cfg = INTERFACES["CH347" if iface == "Auto" else iface]
+        cmd = [exe, "-f", iface_cfg, "-f", str(flash_cfg), "-c", f'program "{path.as_posix()}" verify reset exit']
+        self.flash_btn.configure(state="disabled")
+        self.app.log(f"Flashing {path.name} to {board} ...")
+        self.runner.start(cmd, lambda line: self.app.log(line, "INFO"), lambda code: self.done(code, path))
+
+    def done(self, code, path):
+        self.flash_btn.configure(state="normal")
+        if code == 0:
+            self.app.log("Flash completed successfully.", "OK")
+            if self.delete_after.get():
+                try:
+                    path.unlink()
+                    self.app.log("Firmware binary deleted.", "INFO")
+                except OSError as exc:
+                    self.app.log(f"Could not delete binary: {exc}", "WARN")
+        else:
+            self.app.log(f"Flashing stopped (exit code {code}).", "ERR")
+
+
+class MakcuView(BaseView):
+    def __init__(self, app, parent):
+        super().__init__(app, parent, "Makcu", "Install the serial bridge driver and launch the Makcu AIO utility")
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="x")
+        body.grid_columnconfigure((0, 1), weight=1, uniform="c")
+        left, right = make_card(body), make_card(body)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        card_title(left, "Makcu driver").pack(fill="x", padx=20, pady=(16, 2))
+        ctk.CTkLabel(left, text="Installs the WCH CH343 USB-to-UART driver.", font=ctk.CTkFont(FONT, 12),
+                     text_color=MUTED, anchor="w").pack(fill="x", padx=20, pady=(0, 10))
+        make_button(left, "Install Makcu Driver",
+                    lambda: launch_file(app, TOOLS / "drivers" / "CH343SER.EXE", "CH343 driver installer")).pack(fill="x", padx=20, pady=(0, 18))
+        card_title(right, "Makcu AIO utility").pack(fill="x", padx=20, pady=(16, 2))
+        ctk.CTkLabel(right, text="Opens the standalone Makcu AIO control software.", font=ctk.CTkFont(FONT, 12),
+                     text_color=MUTED, anchor="w").pack(fill="x", padx=20, pady=(0, 10))
+        make_button(right, "Launch Makcu AIO",
+                    lambda: launch_file(app, TOOLS / "makcu" / "MakcuAIO.exe", "Makcu AIO"), "glow").pack(fill="x", padx=20, pady=(0, 18))
+        EclipseArt(self).pack(fill="both", expand=True, pady=(12, 0))
+
+
+# ----------------------------------------------------------------------------- app
+class MercureApp(ctk.CTk):
+    NAV = [
+        ("Auto-Detect", AutoDetectView),
+        ("DNA Grabber", DNAView),
+        ("Speed Test", SpeedTestView),
+        ("Drivers", DriversView),
+        ("Device Flasher", FlasherView),
+        ("Makcu", MakcuView),
+    ]
+
     def __init__(self):
-        super().__init__()
+        super().__init__(fg_color=BG)
         ctk.set_appearance_mode("dark")
-        self.title(f"{APP_NAME} v{VERSION}")
-        self.geometry("1020x700")
-        self.minsize(920, 620)
-        self.configure(fg_color=BG)
-
-        self.model = ctk.StringVar(value="35T")
-        self.cable = ctk.StringVar(value="Auto")
-        self.fw_path = ctk.StringVar()
-        self.serial = None
-        self.pages = {}
+        self.title(f"{APP_NAME} - v{APP_VERSION}")
+        self.geometry("1000x650")
+        self.minsize(900, 600)
+        self.q = queue.Queue()
+        self.board_var = ctk.StringVar(value="35T")
+        self.iface_var = ctk.StringVar(value="Auto")
+        self.board_listeners = []
+        self.views, self.nav_buttons, self.board_buttons, self.current = {}, {}, {}, None
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
-        self._build_sidebar()
-        self._build_main()
-        self.show("detect")
-        self.log(f"{APP_NAME} {VERSION} prêt. Matériel : 35T / 75T / 100T")
+        self.icon_planet = make_planet_icon(30)
+        self.icon_discord = make_discord_icon(18)
 
-    # --- utilitaires UI
-    def ui(self, fn):
-        self.after(0, fn)
+        self.build_sidebar()
+        self.build_main()
+        enable_dark_titlebar(self)
+        self.after(40, self.pump)
+        self.show("Auto-Detect")
+        self.startup_log()
 
-    def log(self, msg, color=None):
-        def _w():
-            self.console.configure(state="normal")
-            self.console.insert("end", time.strftime("[%H:%M:%S] ") + str(msg) + "\n")
-            self.console.see("end")
-            self.console.configure(state="disabled")
-        self.ui(_w)
+    # ---- thread-safe plumbing
+    def post(self, fn, *args):
+        self.q.put((fn, args))
 
-    def bg(self, fn, *args):
-        def w():
-            try:
+    def pump(self):
+        try:
+            while True:
+                fn, args = self.q.get_nowait()
                 fn(*args)
-            except Exception as e:  # noqa
-                self.log(f"[ERREUR] {e}")
-        threading.Thread(target=w, daemon=True).start()
+        except queue.Empty:
+            pass
+        self.after(40, self.pump)
 
-    def btn(self, parent, text, cmd, **kw):
-        return ctk.CTkButton(parent, text=text, command=cmd, fg_color=ACCENT,
-                             hover_color=ACCENT_HOVER, text_color="#04121c",
-                             font=ctk.CTkFont(weight="bold"), corner_radius=8, **kw)
+    def log_threadsafe(self, msg, level="INFO"):
+        self.post(self.log, msg, level)
 
-    def card(self, page, title, subtitle=""):
-        ctk.CTkLabel(page, text=title, font=ctk.CTkFont(size=24, weight="bold"),
-                     text_color=SILVER).pack(anchor="w", padx=24, pady=(20, 0))
-        if subtitle:
-            ctk.CTkLabel(page, text=subtitle, text_color="#7f8da3").pack(anchor="w", padx=24, pady=(0, 10))
-        c = ctk.CTkFrame(page, fg_color=CARD, corner_radius=12)
-        c.pack(fill="x", padx=24, pady=8)
-        return c
+    def log(self, msg, level="INFO"):
+        stamp = time.strftime("[%H:%M:%S]")
+        append_text(self.console_box, f"{stamp} [{level}] {msg}", level)
 
-    def value_label(self, parent, label):
-        row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=18, pady=6)
-        ctk.CTkLabel(row, text=label, width=150, anchor="w", text_color="#7f8da3").pack(side="left")
-        v = ctk.CTkLabel(row, text="—", anchor="w", text_color=SILVER,
-                         font=ctk.CTkFont(family="Consolas", size=14))
-        v.pack(side="left", fill="x", expand=True)
-        return v
+    # ---- layout
+    def build_sidebar(self):
+        side = ctk.CTkFrame(self, width=230, fg_color=SIDEBAR, corner_radius=0, border_width=0)
+        side.grid(row=0, column=0, sticky="nsew")
+        side.grid_propagate(False)
+        ctk.CTkFrame(side, width=1, fg_color=BORDER).place(relx=1, rely=0, relheight=1, anchor="ne")
 
-    # --- structure
-    def _build_sidebar(self):
-        sb = ctk.CTkFrame(self, width=220, fg_color=PANEL, corner_radius=0)
-        sb.grid(row=0, column=0, sticky="nsw")
-        sb.grid_propagate(False)
-        ctk.CTkLabel(sb, text="☿ MERCURE", font=ctk.CTkFont(size=22, weight="bold"),
-                     text_color=ACCENT).pack(pady=(24, 0))
-        ctk.CTkLabel(sb, text="T O O L S", text_color=SILVER,
-                     font=ctk.CTkFont(size=12)).pack(pady=(0, 20))
+        brand = ctk.CTkFrame(side, fg_color="transparent")
+        brand.pack(fill="x", padx=18, pady=(22, 20))
+        ctk.CTkLabel(brand, text="", image=self.icon_planet).pack(side="left")
+        ctk.CTkLabel(brand, text="MERCURE TOOLS", font=ctk.CTkFont(FONT, 15, "bold"), text_color=SILVER).pack(side="left", padx=10)
 
-        self.nav = {}
-        for key, label in [("detect", "🔍  Auto-Detect"), ("dna", "🧬  DNA Grabber"),
-                           ("speed", "⚡  Speed Test"), ("drivers", "🧩  Drivers"),
-                           ("flash", "💾  Device Flasher"), ("makcu", "🖱  Makcu")]:
-            b = ctk.CTkButton(sb, text=label, anchor="w", fg_color="transparent",
-                              hover_color=CARD, text_color=SILVER, height=40,
-                              command=lambda k=key: self.show(k))
-            b.pack(fill="x", padx=12, pady=2)
-            self.nav[key] = b
+        for name, _ in self.NAV:
+            btn = ctk.CTkButton(
+                side, text=name, anchor="w", height=40, corner_radius=10, border_width=1,
+                fg_color="transparent", border_color=SIDEBAR, hover_color=CARD_HI, text_color=MUTED,
+                font=ctk.CTkFont(FONT, 13, "bold"), command=lambda n=name: self.show(n),
+            )
+            btn.pack(fill="x", padx=14, pady=3)
+            self.nav_buttons[name] = btn
 
-        ctk.CTkLabel(sb, text="Carte", text_color="#7f8da3").pack(anchor="w", padx=16, pady=(24, 0))
-        ctk.CTkSegmentedButton(sb, values=list(MODELS), variable=self.model,
-                               selected_color=ACCENT, selected_hover_color=ACCENT_HOVER
-                               ).pack(fill="x", padx=12, pady=4)
-        ctk.CTkLabel(sb, text="Interface JTAG", text_color="#7f8da3").pack(anchor="w", padx=16, pady=(10, 0))
-        ctk.CTkOptionMenu(sb, values=["Auto"] + list(CABLES), variable=self.cable,
-                          fg_color=CARD, button_color=ACCENT).pack(fill="x", padx=12, pady=4)
+        bottom = ctk.CTkFrame(side, fg_color=CARD, border_color=BORDER, border_width=1, corner_radius=12)
+        bottom.pack(side="bottom", fill="x", padx=14, pady=16)
+        ctk.CTkLabel(bottom, text="Board", font=ctk.CTkFont(FONT, 12), text_color=MUTED, anchor="w").pack(fill="x", padx=12, pady=(12, 4))
+        row = ctk.CTkFrame(bottom, fg_color="transparent")
+        row.pack(fill="x", padx=8)
+        for b in BOARDS:
+            btn = ctk.CTkButton(row, text=b, width=58, height=32, corner_radius=8, border_width=1,
+                                font=ctk.CTkFont(FONT, 12, "bold"), command=lambda x=b: self.select_board(x))
+            btn.pack(side="left", expand=True, padx=3)
+            self.board_buttons[b] = btn
+        ctk.CTkLabel(bottom, text="JTAG interface", font=ctk.CTkFont(FONT, 12), text_color=MUTED, anchor="w").pack(fill="x", padx=12, pady=(12, 4))
+        ctk.CTkOptionMenu(
+            bottom, values=["Auto", *INTERFACES], variable=self.iface_var, height=32, fg_color=BG_DEEP,
+            button_color=CARD_HI, button_hover_color="#1c2132", dropdown_fg_color=CARD,
+            dropdown_hover_color=CARD_HI, text_color=SILVER, font=ctk.CTkFont(FONT, 12),
+        ).pack(fill="x", padx=12, pady=(0, 14))
+        self.style_boards()
 
-    def _build_main(self):
+    def build_main(self):
         main = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
         main.grid(row=0, column=1, sticky="nsew")
-        main.grid_rowconfigure(0, weight=1)
         main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(1, weight=1)
 
-        self.container = ctk.CTkFrame(main, fg_color="transparent")
-        self.container.grid(row=0, column=0, sticky="nsew")
-        for key, fn in [("detect", self.page_detect), ("dna", self.page_dna),
-                        ("speed", self.page_speed), ("drivers", self.page_drivers),
-                        ("flash", self.page_flash), ("makcu", self.page_makcu)]:
-            f = ctk.CTkFrame(self.container, fg_color="transparent")
-            fn(f)
-            self.pages[key] = f
+        top = ctk.CTkFrame(main, fg_color="transparent", height=34)
+        top.grid(row=0, column=0, sticky="ew", padx=24, pady=(10, 0))
+        self.hw_label = ctk.CTkLabel(top, text="●  NO HARDWARE CONNECTED", font=ctk.CTkFont(FONT, 11, "bold"), text_color=MUTED)
+        self.hw_label.pack(side="right")
 
-        self.console = ctk.CTkTextbox(main, height=180, fg_color=PANEL, text_color=SILVER,
-                                      font=ctk.CTkFont(family="Consolas", size=12), state="disabled")
-        self.console.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 18))
+        self.content = ctk.CTkFrame(main, fg_color="transparent")
+        self.content.grid(row=1, column=0, sticky="nsew", padx=24, pady=(4, 10))
 
-    def show(self, key):
-        for f in self.pages.values():
-            f.pack_forget()
-        self.pages[key].pack(fill="both", expand=True)
-        for k, b in self.nav.items():
-            b.configure(fg_color=CARD if k == key else "transparent")
+        console = make_card(main)
+        console.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 8))
+        head = ctk.CTkFrame(console, fg_color="transparent")
+        head.pack(fill="x", padx=14, pady=(10, 6))
+        ctk.CTkLabel(head, text="System log", font=ctk.CTkFont(FONT, 12, "bold"), text_color=MUTED).pack(side="left")
+        make_button(head, "Copy logs", self.copy_logs, "small", width=82).pack(side="right")
+        make_button(head, "Clear", self.clear_logs, "small", width=60).pack(side="right", padx=6)
+        self.console_box = make_log_box(console, height=118)
+        self.console_box.pack(fill="x", padx=14, pady=(0, 14))
 
-    # --- 1. Auto-detect
-    def page_detect(self, p):
-        c = self.card(p, "Hardware Auto-Detect", "Détecte la puce Artix-7 via l'IDCODE JTAG")
-        self.d_chip = self.value_label(c, "Puce")
-        self.d_id = self.value_label(c, "IDCODE")
-        self.d_cable = self.value_label(c, "Interface")
-        self.d_match = self.value_label(c, "Carte sélectionnée")
-        self.btn(c, "Lancer la détection", lambda: self.bg(self.do_detect), height=38
-                 ).pack(anchor="w", padx=18, pady=14)
+        footer = ctk.CTkFrame(main, fg_color=SIDEBAR, corner_radius=0, height=34)
+        footer.grid(row=3, column=0, sticky="ew")
+        link = ctk.CTkFrame(footer, fg_color="transparent", cursor="hand2")
+        link.pack(pady=6)
+        icon = ctk.CTkLabel(link, text="", image=self.icon_discord)
+        icon.pack(side="left")
+        text = ctk.CTkLabel(link, text=f"Join our Discord Community :  {DISCORD_URL}",
+                            font=ctk.CTkFont(FONT, 12), text_color=ACCENT, cursor="hand2")
+        text.pack(side="left", padx=8)
+        for w in (link, icon, text):
+            w.bind("<Button-1>", lambda e: webbrowser.open(DISCORD_URL))
+        text.bind("<Enter>", lambda e: text.configure(text_color="#c4d7ff"))
+        text.bind("<Leave>", lambda e: text.configure(text_color=ACCENT))
 
-    def do_detect(self):
-        self.log("Détection en cours…")
-        code, cab = jtag_idcode(self.cable.get())
-        chip = IDCODES.get(code & 0x0FFFFFFF, "Inconnue")
-        sel = self.model.get()
-        self.ui(lambda: (self.d_chip.configure(text=chip, text_color=OK if chip != "Inconnue" else ERR),
-                         self.d_id.configure(text=f"0x{code:08X}"),
-                         self.d_cable.configure(text=cab)))
-        if chip != "Inconnue":
-            det = chip.replace("XC7A", "")
-            self.ui(lambda: (self.model.set(det),
-                             self.d_match.configure(text=f"Auto-sélection : {det}", text_color=OK)))
-        self.log(f"Puce détectée : {chip} (IDCODE 0x{code:08X}) via {cab}")
+    # ---- behaviour
+    def show(self, name):
+        if self.current:
+            self.views[self.current].pack_forget()
+        if name not in self.views:
+            cls = dict(self.NAV)[name]
+            self.views[name] = cls(self, self.content)
+        self.views[name].pack(fill="both", expand=True)
+        self.views[name].on_show()
+        self.current = name
+        for n, btn in self.nav_buttons.items():
+            active = n == name
+            btn.configure(
+                fg_color=ACCENT_BG if active else "transparent",
+                border_color=ACCENT_DIM if active else SIDEBAR,
+                text_color=SILVER if active else MUTED,
+            )
 
-    # --- 2. DNA
-    def page_dna(self, p):
-        c = self.card(p, "DNA Grabber", "Lit le Device DNA (57 bits) de l'Artix-7 via JTAG (ISC_DNA)")
-        self.dna57 = self.value_label(c, "DNA (57 bits)")
-        self.dnaraw = self.value_label(c, "Brut (64 bits)")
-        row = ctk.CTkFrame(c, fg_color="transparent")
-        row.pack(anchor="w", padx=18, pady=14)
-        self.btn(row, "Récupérer le DNA", lambda: self.bg(self.do_dna), height=38).pack(side="left")
-        self.btn(row, "Copier", self.copy_dna, height=38, width=90).pack(side="left", padx=10)
+    def style_boards(self):
+        for b, btn in self.board_buttons.items():
+            active = b == self.board_var.get()
+            btn.configure(
+                fg_color=ACCENT_BG if active else BG_DEEP,
+                border_color=ACCENT if active else BORDER,
+                text_color="#eaf1ff" if active else MUTED,
+                hover_color="#1d2540",
+            )
 
-    def do_dna(self):
-        raw = jtag_dna(self.cable.get())
-        d57 = raw & ((1 << 57) - 1)
-        self.ui(lambda: (self.dna57.configure(text=f"{d57:015X}", text_color=OK),
-                         self.dnaraw.configure(text=f"{raw:016X}")))
-        self.log(f"DNA : {d57:015X} (brut {raw:016X})")
-
-    def copy_dna(self):
-        t = self.dna57.cget("text")
-        if t != "—":
-            self.clipboard_clear()
-            self.clipboard_append(t)
-            self.log("DNA copié dans le presse-papiers.")
-
-    # --- 3. Speed test
-    def page_speed(self, p):
-        c = self.card(p, "Speed Test", "Mesure débit & latence via LeechCore (carte active dans la cible)")
-        self.s_thr = self.value_label(c, "Débit")
-        self.s_lat = self.value_label(c, "Latence (4 KB)")
-        self.s_ok = self.value_label(c, "Lectures OK")
-        self.s_bar = ctk.CTkProgressBar(c, progress_color=ACCENT)
-        self.s_bar.set(0)
-        self.s_bar.pack(fill="x", padx=18, pady=(8, 0))
-        self.btn(c, "Lancer le test", lambda: self.bg(self.do_speed), height=38
-                 ).pack(anchor="w", padx=18, pady=14)
-
-    def do_speed(self):
-        try:
-            from leechcorepyc import LeechCore
-        except ImportError:
-            raise RuntimeError("leechcorepyc indisponible dans ce build.")
-        self.log("Ouverture du device FPGA (LeechCore)…")
-        lc = LeechCore("fpga")
-        try:
-            addr, chunk, total = 0x1000, 0x100000, 64  # 64 x 1 MB
-            ok, t0 = 0, time.perf_counter()
-            for i in range(total):
-                try:
-                    lc.read(addr + i * chunk, chunk)
-                    ok += 1
-                except Exception:
-                    pass
-                self.ui(lambda v=(i + 1) / total: self.s_bar.set(v))
-            dt = time.perf_counter() - t0
-            mbs = ok * chunk / dt / 1048576
-            lats = []
-            for _ in range(200):
-                t = time.perf_counter()
-                try:
-                    lc.read(addr, 0x1000)
-                    lats.append((time.perf_counter() - t) * 1000)
-                except Exception:
-                    pass
-            lat = sum(lats) / len(lats) if lats else float("nan")
-            self.ui(lambda: (self.s_thr.configure(text=f"{mbs:.1f} MB/s", text_color=OK),
-                             self.s_lat.configure(text=f"{lat:.3f} ms"),
-                             self.s_ok.configure(text=f"{ok}/{total}")))
-            self.log(f"Speed test : {mbs:.1f} MB/s, latence {lat:.3f} ms, {ok}/{total} OK")
-        finally:
-            lc.close()
-
-    # --- 4. Drivers
-    def page_drivers(self, p):
-        c = self.card(p, "Driver Installation", "Cartes DMA (FTDI / WinUSB) et Makcu (WCH CH343)")
-        ctk.CTkLabel(c, text="Installer depuis un dossier contenant des .inf (admin requis) :",
-                     text_color="#7f8da3").pack(anchor="w", padx=18, pady=(14, 4))
-        self.btn(c, "Choisir un dossier de pilotes…", self.install_inf, height=38
-                 ).pack(anchor="w", padx=18, pady=(0, 10))
-        ctk.CTkLabel(c, text="Télécharger les pilotes officiels :", text_color="#7f8da3"
-                     ).pack(anchor="w", padx=18, pady=(10, 4))
-        for name, url in LINKS.items():
-            ctk.CTkButton(c, text=name, fg_color=PANEL, hover_color=BG, text_color=SILVER,
-                          anchor="w", command=lambda u=url: webbrowser.open(u), height=34
-                          ).pack(fill="x", padx=18, pady=3)
-        ctk.CTkLabel(c, text="Astuce : pour le JTAG, remplace le driver de l'interface 0 du "
-                             "FT2232H par WinUSB avec Zadig.", text_color=WARN, wraplength=640,
-                     justify="left").pack(anchor="w", padx=18, pady=14)
-
-    def install_inf(self):
-        d = filedialog.askdirectory(title="Dossier de pilotes")
-        if d:
-            self.bg(self._pnputil, d)
-
-    def _pnputil(self, d):
-        if os.name != "nt":
-            raise RuntimeError("pnputil n'existe que sous Windows.")
-        self.log(f"Installation des pilotes depuis {d}…")
-        rc = run_cmd(["pnputil", "/add-driver", os.path.join(d, "*.inf"), "/subdirs", "/install"], self.log)
-        self.log("Pilotes installés." if rc == 0 else f"pnputil a retourné le code {rc} (lancer en admin ?)")
-
-    # --- 5. Flasher
-    def page_flash(self, p):
-        c = self.card(p, "Device Flasher", "Flash d'un firmware .bin sur la SPI flash (via openFPGALoader)")
-        row = ctk.CTkFrame(c, fg_color="transparent")
-        row.pack(fill="x", padx=18, pady=(14, 6))
-        ctk.CTkEntry(row, textvariable=self.fw_path, placeholder_text="Fichier firmware .bin",
-                     fg_color=PANEL).pack(side="left", fill="x", expand=True)
-        self.btn(row, "Parcourir", self.pick_fw, width=100).pack(side="left", padx=(8, 0))
-        row2 = ctk.CTkFrame(c, fg_color="transparent")
-        row2.pack(fill="x", padx=18, pady=6)
-        ctk.CTkLabel(row2, text="Référence FPGA :", text_color="#7f8da3").pack(side="left")
-        self.part = ctk.CTkEntry(row2, width=190, fg_color=PANEL)
-        self.part.insert(0, MODELS["35T"])
-        self.part.pack(side="left", padx=8)
-        self.verify = ctk.CTkCheckBox(row2, text="Vérifier", fg_color=ACCENT)
-        self.verify.select()
-        self.verify.pack(side="left", padx=10)
-        self.model.trace_add("write", lambda *_: (self.part.delete(0, "end"),
-                                                  self.part.insert(0, MODELS.get(self.model.get(), ""))))
-        self.f_bar = ctk.CTkProgressBar(c, progress_color=ACCENT, mode="indeterminate")
-        self.f_bar.pack(fill="x", padx=18, pady=8)
-        self.f_bar.set(0)
-        self.btn(c, "⚠ Flasher la carte", self.confirm_flash, height=40,
-                 ).pack(anchor="w", padx=18, pady=14)
-
-    def pick_fw(self):
-        f = filedialog.askopenfilename(filetypes=[("Firmware", "*.bin"), ("Tous", "*.*")])
-        if f:
-            self.fw_path.set(f)
-
-    def confirm_flash(self):
-        fw = self.fw_path.get()
-        if not fw or not os.path.isfile(fw):
-            self.log("[ERREUR] Sélectionne un fichier .bin valide.")
+    def select_board(self, board):
+        if board not in BOARDS:
             return
-        self.bg(self.do_flash, fw, self.part.get().strip(), bool(self.verify.get()))
+        changed = board != self.board_var.get()
+        self.board_var.set(board)
+        self.style_boards()
+        for fn in self.board_listeners:
+            fn()
+        if changed:
+            self.log(f"Board set to {board}.")
 
-    def do_flash(self, fw, part, verify):
-        ofl = find_ofl()
-        if not ofl:
-            raise RuntimeError("openFPGALoader introuvable (non embarqué dans ce build).")
-        cab = self.cable.get()
-        cab_ofl = CABLES["FT2232H" if cab == "Auto" else cab][1]
-        cmd = [ofl, "-c", cab_ofl, "--fpga-part", part, "-f", fw, "-r"]
-        if verify:
-            cmd.insert(-1, "--verify")
-        self.log("Flash : " + " ".join(cmd))
-        self.ui(lambda: self.f_bar.start())
-        try:
-            rc = run_cmd(cmd, self.log)
-        finally:
-            self.ui(lambda: (self.f_bar.stop(), self.f_bar.set(0)))
-        self.log("✔ Flash terminé." if rc == 0 else f"✘ Échec du flash (code {rc}).")
+    def set_hardware(self, text, connected):
+        self.hw_label.configure(text=f"●  {text.upper()}", text_color=OK if connected else MUTED)
 
-    # --- 6. Makcu
-    def page_makcu(self, p):
-        c = self.card(p, "Makcu Management", "Connexion série (CH343) et commandes de base")
-        row = ctk.CTkFrame(c, fg_color="transparent")
-        row.pack(fill="x", padx=18, pady=(14, 6))
-        self.mk_port = ctk.CTkOptionMenu(row, values=["—"], fg_color=PANEL, button_color=ACCENT, width=300)
-        self.mk_port.pack(side="left")
-        self.btn(row, "↻", self.refresh_ports, width=40).pack(side="left", padx=6)
-        self.mk_baud = ctk.CTkEntry(row, width=100, fg_color=PANEL)
-        self.mk_baud.insert(0, "115200")
-        self.mk_baud.pack(side="left", padx=6)
-        self.mk_state = self.value_label(c, "État")
-        self.mk_ver = self.value_label(c, "Version")
-        r2 = ctk.CTkFrame(c, fg_color="transparent")
-        r2.pack(anchor="w", padx=18, pady=6)
-        for t, f in [("Connecter", self.mk_connect), ("Déconnecter", self.mk_disconnect),
-                     ("Version", lambda: self.bg(self.mk_version)),
-                     ("Test mouvement", lambda: self.bg(self.mk_test)),
-                     ("Commande…", self.mk_custom)]:
-            self.btn(r2, t, f, height=34).pack(side="left", padx=(0, 8))
-        self.mk_cmd = ctk.CTkEntry(c, placeholder_text="ex: km.version()", fg_color=PANEL)
-        self.mk_cmd.pack(fill="x", padx=18, pady=(4, 14))
-        self.refresh_ports()
+    def copy_logs(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.console_box.get("1.0", "end").strip())
 
-    def refresh_ports(self):
-        try:
-            from serial.tools import list_ports
-            ports = []
-            for pt in list_ports.comports():
-                tag = " (CH343/Makcu?)" if pt.vid == 0x1A86 else ""
-                ports.append(f"{pt.device} - {pt.description}{tag}")
-            self.mk_port.configure(values=ports or ["Aucun port"])
-            self.mk_port.set(next((x for x in ports if "Makcu" in x), ports[0] if ports else "Aucun port"))
-        except Exception as e:  # noqa
-            self.log(f"[ERREUR] {e}")
+    def clear_logs(self):
+        self.console_box.configure(state="normal")
+        self.console_box.delete("1.0", "end")
+        self.console_box.configure(state="disabled")
 
-    def mk_connect(self):
-        import serial
-        port = self.mk_port.get().split(" ")[0]
-        self.mk_disconnect()
-        try:
-            self.serial = serial.Serial(port, int(self.mk_baud.get()), timeout=0.5)
-            self.mk_state.configure(text=f"Connecté ({port})", text_color=OK)
-            self.log(f"Makcu connecté sur {port}")
-        except Exception as e:  # noqa
-            self.mk_state.configure(text="Erreur", text_color=ERR)
-            self.log(f"[ERREUR] {e}")
-
-    def mk_disconnect(self):
-        if self.serial:
-            try:
-                self.serial.close()
-            except Exception:
-                pass
-            self.serial = None
-            self.mk_state.configure(text="Déconnecté", text_color=SILVER)
-
-    def mk_send(self, cmd):
-        if not self.serial or not self.serial.is_open:
-            raise RuntimeError("Makcu non connecté.")
-        self.serial.reset_input_buffer()
-        self.serial.write((cmd + "\r\n").encode())
-        time.sleep(0.15)
-        resp = self.serial.read(self.serial.in_waiting or 1).decode(errors="replace").strip()
-        self.log(f">> {cmd}" + (f"\n<< {resp}" if resp else ""))
-        return resp
-
-    def mk_version(self):
-        r = self.mk_send("km.version()")
-        self.ui(lambda: self.mk_ver.configure(text=r.splitlines()[-1] if r else "—"))
-
-    def mk_test(self):
-        self.mk_send("km.move(50,0)")
-        time.sleep(0.2)
-        self.mk_send("km.move(-50,0)")
-
-    def mk_custom(self):
-        c = self.mk_cmd.get().strip()
-        if c:
-            self.bg(self.mk_send, c)
+    def startup_log(self):
+        self.log(f"{APP_NAME} {APP_VERSION} ready. Hardware : 35T / 75T / 100T", "OK")
+        exe = find_openocd()
+        self.log(f"OpenOCD: {'found' if exe else 'not found (put it in tools/openocd/bin)'}", "INFO" if exe else "WARN")
+        self.log(f"Tools folder: {TOOLS}")
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    MercureApp().mainloop()
